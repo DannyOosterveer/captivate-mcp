@@ -1,0 +1,43 @@
+{
+  "name": "captivate-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for the Captivate.fm podcast hosting API: shows, episodes and listening analytics",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "captivate-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc && chmod +x dist/index.js",
+    "prepare": "npm run build",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "captivate",
+    "podcast",
+    "analytics",
+    "claude"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DannyOosterveer/captivate-mcp.git"
+  },
+  "homepage": "https://github.com/DannyOosterveer/captivate-mcp#readme",
+  "author": "Danny Oosterveer"
+}
