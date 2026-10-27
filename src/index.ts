@@ -32,6 +32,22 @@ const EPISODE_SUMMARY_FIELDS = [
   "slug",
 ] as const;
 
+type Point = { timestamp: number; total: number };
+
+// Buckets start at midnight in the requested timezone, so format them in that timezone ("2026-10-01" or "2026-10-01 13:00").
+const localDate = (ms: number, timeZone: string) =>
+  new Date(ms)
+    .toLocaleString("sv-SE", { timeZone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })
+    .replace(" 00:00", "");
+const timeSeries = (points: Point[] = [], timeZone: string) =>
+  points.map(({ timestamp, total }) => ({ date: localDate(timestamp, timeZone), total }));
+const byTotal = <T extends { total: number }>(items: T[] = []) => [...items].sort((a, b) => b.total - a.total);
+
+async function episodeTitles(showId: string): Promise<Map<string, string>> {
+  const res = await captivate.request<{ episodes?: Episode[] }>("GET", `/shows/${showId}/episodes`);
+  return new Map((res.episodes ?? []).map((ep) => [ep.id, ep.title ?? ""]));
+}
+
 function ok(data: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
 }
@@ -139,22 +155,48 @@ server.registerTool(
   {
     title: "Overview analytics",
     description:
-      "Downloads and unique listeners for a show (optionally with its top episodes) or a single episode over a date range.",
+      "Downloads for a show (with its top episodes in that period) or for a single episode over a date range.",
     inputSchema: {
       show_id: showId,
       episode_id: episodeId.optional().describe("Limit to one episode"),
       start: date("Start"),
       end: date("End"),
-      include_top_episodes: z.boolean().optional().describe("Show-level only: include the top episodes (default true)"),
+      top_episodes: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("Show-level only: how many top episodes to include, ranked by downloads in the period (default 10)"),
     },
     annotations: { readOnlyHint: true },
   },
-  ({ show_id, episode_id, start, end, include_top_episodes }) =>
-    run(() =>
-      captivate.request("GET", `/insights/${show_id}/overview${episode_id ? `/${episode_id}` : ""}`, {
-        query: { start, end, includeTopEpisodes: episode_id ? undefined : (include_top_episodes ?? true) },
-      }),
-    ),
+  ({ show_id, episode_id, start, end, top_episodes }) =>
+    run(async () => {
+      const res = await captivate.request<Record<string, unknown>>(
+        "GET",
+        `/insights/${show_id}/overview${episode_id ? `/${episode_id}` : ""}`,
+        { query: { start, end } },
+      );
+      const limit = top_episodes ?? 10;
+      if (episode_id || limit === 0) return res;
+
+      // The overview endpoint's own top_episodes carry a "downloads" figure that doesn't match the
+      // period's totals, so rank episodes with the range endpoint instead.
+      const [range, titles] = await Promise.all([
+        captivate.request<{ byEpisode?: { episodeId: string; total: number }[] }>(
+          "POST",
+          `/insights/${show_id}/range`,
+          { body: { start, end, interval: "1d", timezone: "UTC", countryCode: null, types: ["byEpisode"] } },
+        ),
+        episodeTitles(show_id),
+      ]);
+      return {
+        ...res,
+        top_episodes: byTotal(range.byEpisode)
+          .slice(0, limit)
+          .map(({ episodeId, total }) => ({ id: episodeId, title: titles.get(episodeId), downloads: total })),
+      };
+    }),
 );
 
 server.registerTool(
@@ -178,7 +220,13 @@ server.registerTool(
     annotations: { readOnlyHint: true },
   },
   ({ show_id, episode_id }) =>
-    run(() => captivate.request("GET", `/insights/${show_id}/monthly${episode_id ? `/${episode_id}` : ""}`)),
+    run(async () => {
+      const res = await captivate.request<{ past_12_months?: { x: string; y: number }[] }>(
+        "GET",
+        `/insights/${show_id}/monthly${episode_id ? `/${episode_id}` : ""}`,
+      );
+      return (res.past_12_months ?? []).map(({ x, y }) => ({ month: x, downloads: y }));
+    }),
 );
 
 server.registerTool(
@@ -224,22 +272,61 @@ server.registerTool(
         .array(z.enum(BREAKDOWNS))
         .optional()
         .describe("Which breakdowns to include (default: all; byEpisode only applies to shows)"),
+      breakdown_time_series: z
+        .boolean()
+        .optional()
+        .describe("Also return the time series per breakdown item (default false: totals only, much smaller)"),
     },
     annotations: { readOnlyHint: true },
   },
-  ({ show_id, episode_id, start, end, interval, timezone, country_code, breakdowns }) =>
-    run(() =>
-      captivate.request("POST", `/insights/${show_id}/range${episode_id ? `/${episode_id}` : ""}`, {
-        body: {
-          start,
-          end,
-          interval: interval ?? "1d",
-          timezone: timezone ?? "UTC",
-          countryCode: country_code ?? null,
-          types: breakdowns ?? BREAKDOWNS.filter((b) => !(episode_id && b === "byEpisode")),
+  ({ show_id, episode_id, start, end, interval, timezone, country_code, breakdowns, breakdown_time_series }) =>
+    run(async () => {
+      const tz = timezone ?? "UTC";
+      const types = breakdowns ?? BREAKDOWNS.filter((b) => !(episode_id && b === "byEpisode"));
+      const res = await captivate.request<Record<string, any>>(
+        "POST",
+        `/insights/${show_id}/range${episode_id ? `/${episode_id}` : ""}`,
+        {
+          body: {
+            start,
+            end,
+            interval: interval ?? "1d",
+            timezone: tz,
+            countryCode: country_code ?? null,
+            types,
+          },
         },
-      }),
-    ),
+      );
+      const titles = res.byEpisode?.length ? await episodeTitles(show_id) : undefined;
+      const breakdown = (items: (Record<string, any> & { total: number; overTime?: Point[] })[] = []) =>
+        byTotal(items).map(({ overTime, ...item }) => ({
+          ...item,
+          ...(titles && item.episodeId ? { title: titles.get(item.episodeId) } : {}),
+          ...(breakdown_time_series ? { overTime: timeSeries(overTime, tz) } : {}),
+        }));
+
+      return {
+        total: res.total,
+        uniqueTotal: res.uniqueTotal,
+        totalOverTime: timeSeries(res.totalOverTime, tz),
+        totalUniqueOverTime: timeSeries(res.totalUniqueOverTime, tz),
+        ...(res.byEpisode ? { byEpisode: breakdown(res.byEpisode) } : {}),
+        ...(res.byLocation
+          ? {
+              byLocation: Object.fromEntries(
+                Object.entries(res.byLocation as Record<string, any[]>)
+                  .filter(([, v]) => v.length)
+                  .map(([k, v]) => [k, breakdown(v)]),
+              ),
+            }
+          : {}),
+        ...Object.fromEntries(
+          ["byUserAgentBrowser", "byUserAgentOs", "byUserAgentDevice", "byPrivateSubscriber"]
+            .filter((k) => res[k])
+            .map((k) => [k, breakdown(res[k])]),
+        ),
+      };
+    }),
 );
 
 server.registerTool(
@@ -261,7 +348,19 @@ server.registerTool(
           return { id, title: episode.title, published_date: episode.published_date };
         }),
       );
-      return captivate.request("POST", `/insights/${show_id}/compare`, { body: episodes });
+      const res = await captivate.request<{ label: string; data: { x: number; y: number }[] }[]>(
+        "POST",
+        `/insights/${show_id}/compare`,
+        { body: episodes },
+      );
+      return {
+        note: "cumulative_downloads[n] = total downloads n days after publishing",
+        episodes: res.map(({ label, data }) => ({
+          title: label,
+          published_date: episodes.find((ep) => ep.title === label)?.published_date,
+          cumulative_downloads: data.map((p) => p.y),
+        })),
+      };
     }),
 );
 
@@ -277,21 +376,47 @@ server.registerTool(
       episode_id: episodeId,
       start: date("Start"),
       end: date("End"),
-      duration_seconds: z.number().int().positive().optional().describe("Episode duration in seconds"),
+      duration_seconds: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Episode duration in seconds (looked up from the episode's media when omitted)"),
       timezone: z.string().optional().describe("IANA timezone (default UTC)"),
     },
     annotations: { readOnlyHint: true },
   },
   ({ show_id, episode_id, start, end, duration_seconds, timezone }) =>
-    run(() =>
-      captivate.request("POST", `/insights/${show_id}/web-player/${episode_id}`, {
-        body: {
-          dateRange: { gte: start, lte: end },
-          ...(duration_seconds ? { duration: String(duration_seconds) } : {}),
-          timezone: timezone ?? "UTC",
-        },
-      }),
-    ),
+    run(async () => {
+      let duration = duration_seconds;
+      if (!duration) {
+        const { episode } = await captivate.request<{ episode: Episode }>("GET", `/episodes/${episode_id}`);
+        if (!episode.media_id) throw new Error("Episode has no media attached; pass duration_seconds.");
+        const { media } = await captivate.request<{ media: { media_duration?: number } }>(
+          "GET",
+          `/media/${episode.media_id}`,
+        );
+        duration = Math.round(Number(media.media_duration));
+        if (!duration) throw new Error("Could not determine the episode duration; pass duration_seconds.");
+      }
+      const res = await captivate.request<Record<string, any> & { averageCoverage?: Record<string, number> }>(
+        "POST",
+        `/insights/${show_id}/web-player/${episode_id}`,
+        { body: { dateRange: { gte: start, lte: end }, duration: String(duration), timezone: timezone ?? "UTC" } },
+      );
+      // Coverage maps are keyed per 10 seconds; keep the average, resampled to every 5% of the episode.
+      const { averageCoverage, totalCoverage, ...rest } = res;
+      const seconds = Object.keys(averageCoverage ?? {}).map(Number);
+      const coverageAt = (s: number) =>
+        averageCoverage?.[String(seconds.reduce((best, k) => (Math.abs(k - s) < Math.abs(best - s) ? k : best), 0))];
+      return {
+        ...rest,
+        duration_seconds: duration,
+        coverage_by_percent: seconds.length
+          ? Object.fromEntries(Array.from({ length: 21 }, (_, i) => [`${i * 5}%`, coverageAt((duration! * i) / 20)]))
+          : undefined,
+      };
+    }),
 );
 
 await server.connect(new StdioServerTransport());
