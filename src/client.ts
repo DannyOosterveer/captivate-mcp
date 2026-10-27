@@ -15,14 +15,21 @@ export class CaptivateError extends Error {
  * re-authenticates once when the token is rejected.
  */
 export class CaptivateClient {
-  private token: string | undefined;
+  private token: Promise<string> | undefined;
 
   constructor(
     readonly userId: string,
     private readonly apiToken: string,
   ) {}
 
-  private async authenticate(): Promise<string> {
+  /** Shares one token exchange between concurrent requests. */
+  private authenticate(): Promise<string> {
+    this.token = this.fetchToken();
+    this.token.catch(() => (this.token = undefined));
+    return this.token;
+  }
+
+  private async fetchToken(): Promise<string> {
     const form = new FormData();
     form.append("username", this.userId);
     form.append("token", this.apiToken);
@@ -39,7 +46,6 @@ export class CaptivateClient {
         res.status,
       );
     }
-    this.token = token;
     return token;
   }
 
@@ -48,6 +54,10 @@ export class CaptivateClient {
     path: string,
     options: { query?: Record<string, string | number | boolean | undefined>; body?: unknown } = {},
   ): Promise<T> {
+    // IDs end up in the path; refuse anything that could escape it (../, ?, #, %2F).
+    if (!/^(\/[A-Za-z0-9_-]+)+\/?$/.test(path)) {
+      throw new CaptivateError(`Refusing to request unexpected path: ${path}`);
+    }
     const url = new URL(path, BASE_URL);
     for (const [key, value] of Object.entries(options.query ?? {})) {
       if (value !== undefined) url.searchParams.set(key, String(value));
@@ -64,9 +74,13 @@ export class CaptivateClient {
         body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
       });
 
-    let res = await send(this.token ?? (await this.authenticate()));
-    if (res.status === 401 || res.status === 403) {
-      res = await send(await this.authenticate());
+    const token = await (this.token ?? this.authenticate());
+    let res = await send(token);
+    // Only 401 means the token expired; Captivate also answers 403 for unknown IDs.
+    if (res.status === 401) {
+      // Another request may already have refreshed it.
+      const current = await this.token?.catch(() => undefined);
+      res = await send(current && current !== token ? current : await this.authenticate());
     }
 
     const body = await readBody(res);

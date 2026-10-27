@@ -56,12 +56,14 @@ async function run(fn: () => Promise<unknown>) {
   try {
     return ok(await fn());
   } catch (err) {
-    return { isError: true, content: [{ type: "text" as const, text: (err as Error).message }] };
+    return { isError: true, content: [{ type: "text" as const, text: err instanceof Error ? err.message : String(err) }] };
   }
 }
 
-const showId = z.string().describe("Captivate show ID (from list_shows)");
-const episodeId = z.string().describe("Captivate episode ID (from list_episodes)");
+// IDs are interpolated into URL paths, so only accept plain ID characters.
+const id = z.string().regex(/^[A-Za-z0-9_-]+$/, "Invalid ID");
+const showId = id.describe("Captivate show ID (from list_shows)");
+const episodeId = id.describe("Captivate episode ID (from list_episodes)");
 const date = (what: string) =>
   z.string().describe(`${what} date, ISO 8601 (e.g. 2026-01-31 or 2026-01-31T00:00:00Z)`);
 
@@ -132,7 +134,12 @@ server.registerTool(
         const needle = search.toLowerCase();
         episodes = episodes.filter((ep) => String(ep.title ?? "").toLowerCase().includes(needle));
       }
-      return { total: res.count ?? episodes.length, returned: limit ? Math.min(limit, episodes.length) : episodes.length, episodes: limit ? episodes.slice(0, limit) : episodes };
+      return {
+        total_in_show: res.count ?? (res.episodes ?? []).length,
+        matching: episodes.length,
+        returned: limit ? Math.min(limit, episodes.length) : episodes.length,
+        episodes: limit ? episodes.slice(0, limit) : episodes,
+      };
     }),
 );
 
@@ -336,7 +343,7 @@ server.registerTool(
     description: "Compare download performance of several episodes of the same show (aligned from each publish date).",
     inputSchema: {
       show_id: showId,
-      episode_ids: z.array(z.string()).min(2).describe("Two or more episode IDs to compare"),
+      episode_ids: z.array(episodeId).min(2).describe("Two or more episode IDs to compare"),
     },
     annotations: { readOnlyHint: true },
   },
@@ -345,21 +352,27 @@ server.registerTool(
       const episodes = await Promise.all(
         episode_ids.map(async (id) => {
           const { episode } = await captivate.request<{ episode: Episode }>("GET", `/episodes/${id}`);
-          return { id, title: episode.title, published_date: episode.published_date };
+          return { id, title: episode.title ?? "", published_date: episode.published_date };
         }),
       );
+      // The API echoes "title" back as the series label and doesn't keep request order, so send the
+      // ID as the label to match series to episodes even when titles repeat.
       const res = await captivate.request<{ label: string; data: { x: number; y: number }[] }[]>(
         "POST",
         `/insights/${show_id}/compare`,
-        { body: episodes },
+        { body: episodes.map((ep) => ({ ...ep, title: ep.id })) },
       );
       return {
         note: "cumulative_downloads[n] = total downloads n days after publishing",
-        episodes: res.map(({ label, data }) => ({
-          title: label,
-          published_date: episodes.find((ep) => ep.title === label)?.published_date,
-          cumulative_downloads: data.map((p) => p.y),
-        })),
+        episodes: res.map(({ label, data }) => {
+          const ep = episodes.find((e) => e.id === label);
+          return {
+            id: label,
+            title: ep?.title,
+            published_date: ep?.published_date,
+            cumulative_downloads: data.map((p) => p.y),
+          };
+        }),
       };
     }),
 );
@@ -408,7 +421,7 @@ server.registerTool(
       const { averageCoverage, totalCoverage, ...rest } = res;
       const seconds = Object.keys(averageCoverage ?? {}).map(Number);
       const coverageAt = (s: number) =>
-        averageCoverage?.[String(seconds.reduce((best, k) => (Math.abs(k - s) < Math.abs(best - s) ? k : best), 0))];
+        averageCoverage?.[String(seconds.reduce((best, k) => (Math.abs(k - s) < Math.abs(best - s) ? k : best), seconds[0]))];
       return {
         ...rest,
         duration_seconds: duration,
